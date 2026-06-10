@@ -71,6 +71,68 @@ static void fillCheckerboard(uint8_t* buf, int w, int h, int cell_size = 32)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Load a single-channel buffer from a binary PGM (Portable GrayMap).
+//  Returns true on success; prints an error and returns false on failure.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool loadPGM(const char* path, uint8_t* buf, int expected_w, int expected_h)
+{
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Error: could not open '%s' for reading\n", path);
+        return false;
+    }
+    
+    // Parse PGM header
+    char magic[3] = {0};
+    int w = 0, h = 0, maxval = 0;
+    
+    if (fscanf(fp, "%2s\n", magic) != 1 || strcmp(magic, "P5") != 0) {
+        fprintf(stderr, "Error: '%s' is not a binary PGM (P5) file\n", path);
+        fclose(fp);
+        return false;
+    }
+    
+    // Skip comments
+    int c;
+    while ((c = fgetc(fp)) == '#') {
+        while (fgetc(fp) != '\n');
+    }
+    ungetc(c, fp);
+    
+    if (fscanf(fp, "%d %d\n%d\n", &w, &h, &maxval) != 3) {
+        fprintf(stderr, "Error: invalid PGM header in '%s'\n", path);
+        fclose(fp);
+        return false;
+    }
+    
+    if (w != expected_w || h != expected_h) {
+        fprintf(stderr, "Error: PGM dimensions %dx%d don't match expected %dx%d\n",
+                w, h, expected_w, expected_h);
+        fclose(fp);
+        return false;
+    }
+    
+    if (maxval != 255) {
+        fprintf(stderr, "Error: PGM maxval %d is not 255\n", maxval);
+        fclose(fp);
+        return false;
+    }
+    
+    // Read pixel data
+    size_t expected_size = static_cast<size_t>(w) * h;
+    size_t read_size = fread(buf, 1, expected_size, fp);
+    fclose(fp);
+    
+    if (read_size != expected_size) {
+        fprintf(stderr, "Error: incomplete PGM data in '%s' (read %zu, expected %zu)\n",
+                path, read_size, expected_size);
+        return false;
+    }
+    
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Save a single-channel buffer as a binary PGM (Portable GrayMap).
 //  PGM is trivial to parse and is readable by GIMP, ImageMagick, ffplay, etc.
 //  Returns true on success; prints a warning and returns false on failure.
@@ -166,13 +228,23 @@ int main()
     printf("  Total (BSS)   : %zu bytes  (%.2f MB)\n\n",
            total_bytes, static_cast<double>(total_bytes) / (1<<20));
 
-    // ── Synthesise input ───────────────────────────────────────────────────
-    printf("Generating checkerboard test pattern (%d×%d)...\n", IN_W, IN_H);
-    fillCheckerboard(g_src, IN_W, IN_H, 32);
+    // ── Load or synthesise input ───────────────────────────────────────────
+    bool loaded_real_image = false;
+    
+    // Try to load a real fisheye image from "real_fisheye.pgm" if it exists
+    if (loadPGM("real_fisheye.pgm", g_src, IN_W, IN_H)) {
+        printf("Loaded:  real_fisheye.pgm  (%d×%d) — using real fisheye image\n", IN_W, IN_H);
+        loaded_real_image = true;
+    } else {
+        printf("No real_fisheye.pgm found, generating checkerboard test pattern (%d×%d)...\n", IN_W, IN_H);
+        fillCheckerboard(g_src, IN_W, IN_H, 32);
+    }
 
-    // ── Save raw fisheye input ─────────────────────────────────────────────
-    if (savePGM("fisheye_input.pgm", g_src, IN_W, IN_H)) {
-        printf("Saved:  fisheye_input.pgm  (%d×%d)\n", IN_W, IN_H);
+    // ── Save raw fisheye input for reference ───────────────────────────────
+    if (!loaded_real_image) {
+        if (savePGM("fisheye_input.pgm", g_src, IN_W, IN_H)) {
+            printf("Saved:  fisheye_input.pgm  (%d×%d)\n", IN_W, IN_H);
+        }
     }
 
     // ── Build LUT (init phase) ─────────────────────────────────────────────
