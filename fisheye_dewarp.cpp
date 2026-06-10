@@ -26,12 +26,6 @@
 //  Internal constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Sentinel value stored in LUT for pixels that map outside the fisheye circle.
-// INT32_MIN is chosen so that the unsigned-cast OOB check in the hot path
-// automatically catches it: static_cast<uint32_t>(INT32_MIN) is very large,
-// exceeding any valid x_max_fp.
-static constexpr int32_t OOB_SENTINEL = static_cast<int32_t>(0x80000000);
-
 // Newton-Raphson convergence parameters used only in init().
 static constexpr int   NR_MAX_ITER = 8;       // raised from 6; improves accuracy
                                                // for wide-angle (>160°) lenses
@@ -44,7 +38,8 @@ static constexpr float NR_EPSILON  = 1e-7f;
 //  k[0]…k[3] correspond to the calibration-tool labels k1…k4 (1-based).
 //  Called ONLY from init() – floating-point is acceptable here.
 // ─────────────────────────────────────────────────────────────────────────────
-float FisheyeDewarp::evalKBModel(float theta, const float k[4]) noexcept
+float FisheyeDewarp::evalKBModel(float theta,
+                                 const float k[FisheyeIntrinsics::KB_COEFF_COUNT]) noexcept
 {
     const float t2 = theta * theta;
     return theta * (1.0f + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * k[3]))));
@@ -54,7 +49,8 @@ float FisheyeDewarp::evalKBModel(float theta, const float k[4]) noexcept
 //  evalKBDerivative()  (file-scope; used only during init())
 //  dr_d/dθ = 1 + 3·k[0]·θ² + 5·k[1]·θ⁴ + 7·k[2]·θ⁶ + 9·k[3]·θ⁸
 // ─────────────────────────────────────────────────────────────────────────────
-static float evalKBDerivative(float theta, const float k[4]) noexcept
+static float evalKBDerivative(float theta,
+                              const float k[FisheyeIntrinsics::KB_COEFF_COUNT]) noexcept
 {
     const float t2 = theta * theta;
     return 1.0f + t2 * (3.0f*k[0] + t2 * (5.0f*k[1] + t2 * (7.0f*k[2] + t2 * 9.0f*k[3])));
@@ -74,7 +70,8 @@ static float evalKBDerivative(float theta, const float k[4]) noexcept
 //  using the forward model), but retained for future online calibration
 //  refinement / inverse-mapping use cases.
 // ─────────────────────────────────────────────────────────────────────────────
-[[maybe_unused]] static float invertKBModel(float r_d, const float k[4],
+[[maybe_unused]] static float invertKBModel(float r_d,
+                            const float k[FisheyeIntrinsics::KB_COEFF_COUNT],
                             float fx_approx = 1.0f) noexcept
 {
     if (r_d < NR_EPSILON) return 0.0f;
@@ -124,7 +121,7 @@ void FisheyeDewarp::init(const FisheyeIntrinsics& fish,
             // lenses with >180° total FOV (θ > π/2 from axis) are handled
             // correctly — e.g. a 190° lens has max_theta_rad ≈ 95° = 1.658 rad.
             if (theta > fish.max_theta_rad) {
-                lut_[or_][oc] = { OOB_SENTINEL, OOB_SENTINEL };
+                lut_[or_][oc] = { LutEntry::OOB_SENTINEL, LutEntry::OOB_SENTINEL };
                 continue;
             }
 
@@ -152,7 +149,7 @@ void FisheyeDewarp::init(const FisheyeIntrinsics& fish,
             if (src_x < 0.0f || src_x >= static_cast<float>(IN_W - 1) ||
                 src_y < 0.0f || src_y >= static_cast<float>(IN_H - 1))
             {
-                lut_[or_][oc] = { OOB_SENTINEL, OOB_SENTINEL };
+                lut_[or_][oc] = { LutEntry::OOB_SENTINEL, LutEntry::OOB_SENTINEL };
             } else {
                 lut_[or_][oc].src_x_fp = static_cast<int32_t>(src_x * FRAC_SCALE);
                 lut_[or_][oc].src_y_fp = static_cast<int32_t>(src_y * FRAC_SCALE);
@@ -163,6 +160,7 @@ void FisheyeDewarp::init(const FisheyeIntrinsics& fish,
     // Pre-compute inverse dimensions (debug/validation only; not in hot path).
     inv_in_w_fp_ = FRAC_SCALE / IN_W;
     inv_in_h_fp_ = FRAC_SCALE / IN_H;
+    init_done_ = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,9 +190,9 @@ void FisheyeDewarp::init(const FisheyeIntrinsics& fish,
 //     vshrn     – shift and narrow back to u8
 //   Expected throughput: ~4 clock cycles / pixel on Cortex-A72 vs ~12 scalar.
 // ─────────────────────────────────────────────────────────────────────────────
-inline uint8_t FisheyeDewarp::bilinearSample(const uint8_t* __restrict__ src,
-                                              int32_t x_fp,
-                                              int32_t y_fp) noexcept
+uint8_t FisheyeDewarp::bilinearSample(const uint8_t* __restrict__ src,
+                                      int32_t x_fp,
+                                      int32_t y_fp) noexcept
 {
     // Integer pixel coords (floor).  Arithmetic right shift on AArch64: ASR.
     const int32_t xi = x_fp >> FRAC_BITS;
@@ -244,6 +242,7 @@ inline uint8_t FisheyeDewarp::bilinearSample(const uint8_t* __restrict__ src,
 void FisheyeDewarp::processFrame(const uint8_t* __restrict__ src_y,
                                        uint8_t* __restrict__ dst_y) const noexcept
 {
+    assert(init_done_);
     processRows(src_y, dst_y, 0, OUT_H);
 }
 
@@ -281,6 +280,7 @@ void FisheyeDewarp::processRows(const uint8_t* __restrict__ src_y,
                                       uint8_t* __restrict__ dst_y,
                                 int row_start, int row_end) const noexcept
 {
+    assert(init_done_);
     static_assert(OUT_W > 0 && OUT_H > 0, "Output dimensions must be positive");
     static_assert(IN_W  > 0 && IN_H  > 0, "Input dimensions must be positive");
 
