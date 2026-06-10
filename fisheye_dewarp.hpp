@@ -38,9 +38,9 @@
  */
 
 #include <cstdint>
-#include <cstddef>
-#include <cmath>    // used ONLY during init(); not in the hot path
 #include <cassert>
+
+static_assert(__cplusplus >= 201703L, "FisheyeDewarp requires C++17 or newer.");
 
 // ─── compile-time image geometry ─────────────────────────────────────────────
 // Override these via compiler flags: -DFISHEYE_IN_W=1920 etc.
@@ -58,12 +58,14 @@
 #endif
 
 // ─── fixed-point configuration ───────────────────────────────────────────────
-static constexpr int32_t FRAC_BITS  = 16;                    // Q15.16
-static constexpr int32_t FRAC_SCALE = 1 << FRAC_BITS;       // 65536
-static constexpr int32_t FRAC_MASK  = FRAC_SCALE - 1;       // 0x0000FFFF
+constexpr int32_t FRAC_BITS  = 16;                    // Q15.16
+constexpr int32_t FRAC_SCALE = 1 << FRAC_BITS;       // 65536
+constexpr int32_t FRAC_MASK  = FRAC_SCALE - 1;       // 0x0000FFFF
 
 // ─── camera intrinsic model ──────────────────────────────────────────────────
 struct FisheyeIntrinsics {
+    static constexpr int KB_COEFF_COUNT = 4;
+
     float fx;          ///< focal length x  (pixels)
     float fy;          ///< focal length y  (pixels)
     float cx;          ///< principal point x (pixels)
@@ -71,7 +73,7 @@ struct FisheyeIntrinsics {
     // Kannala-Brandt radial coefficients k[0]…k[3] correspond to k1…k4:
     //   r_d = θ + k[0]·θ³ + k[1]·θ⁵ + k[2]·θ⁷ + k[3]·θ⁹
     // Note: array is 0-based; calibration tools may label these k1–k4 (1-based).
-    float k[4];
+    float k[KB_COEFF_COUNT];
     float skew;        ///< axis skew (0 for most modern cameras)
     // Maximum angle from the optical axis that the lens physically covers
     // (radians).  Pixels whose incidence angle exceeds this value are marked
@@ -90,9 +92,10 @@ struct RectIntrinsics {
 // ─── LUT entry ───────────────────────────────────────────────────────────────
 // Stores the fisheye source coordinate for each output pixel in Q15.16.
 // Two int32 per pixel → 8 bytes/pixel.
-// A coordinate value of OOB_SENTINEL (= INT32_MIN, see .cpp) means the pixel
+// A coordinate value of OOB_SENTINEL (= INT32_MIN) means the pixel
 // lies outside the lens circle and must be rendered black.
 struct LutEntry {
+    static constexpr int32_t OOB_SENTINEL = static_cast<int32_t>(0x80000000);
     int32_t src_x_fp;  ///< fisheye X in Q15.16  (OOB_SENTINEL means out-of-bounds)
     int32_t src_y_fp;  ///< fisheye Y in Q15.16
 };
@@ -157,8 +160,16 @@ public:
      * @param  row_end    last  row (exclusive)
      */
     void processRows(const uint8_t* __restrict__ src_y,
-                           uint8_t* __restrict__ dst_y,
-                     int row_start, int row_end) const noexcept;
+                          uint8_t* __restrict__ dst_y,
+                    int row_start, int row_end) const noexcept;
+    /**
+     * @brief  Evaluate the Kannala-Brandt forward projection:
+     *           r_d = θ + k[0]·θ³ + k[1]·θ⁵ + k[2]·θ⁷ + k[3]·θ⁹
+     *         Returns the distorted pixel radius in floating-point.
+     *         Called ONLY during init(); never on the hot path.
+     *         Public so that unit tests and file-scope helpers can call it.
+     */
+    [[nodiscard]] static float evalKBModel(float theta, const float k[FisheyeIntrinsics::KB_COEFF_COUNT]) noexcept;
 
 private:
     // ── static LUT storage ────────────────────────────────────────────────
@@ -172,20 +183,8 @@ private:
     // available for debug/validation; not used in the hot path.
     int32_t inv_in_w_fp_{0};
     int32_t inv_in_h_fp_{0};
+    bool init_done_{false};
 
-    // ── helpers ────────────────────────────────────────────────────────────
-
-public:
-    /**
-     * @brief  Evaluate the Kannala-Brandt forward projection:
-     *           r_d = θ + k[0]·θ³ + k[1]·θ⁵ + k[2]·θ⁷ + k[3]·θ⁹
-     *         Returns the distorted pixel radius in floating-point.
-     *         Called ONLY during init(); never on the hot path.
-     *         Public so that unit tests and file-scope helpers can call it.
-     */
-    static float evalKBModel(float theta, const float k[4]) noexcept;
-
-private:
     /**
      * @brief  Bilinear sample of src at position (x_fp, y_fp) in Q15.16.
      *
@@ -209,6 +208,6 @@ private:
      *     vshrn_n_u32 – shift and narrow back to u8
      *   Expected throughput: ~4 clock cycles / pixel on Cortex-A72 vs ~12 scalar.
      */
-    static inline uint8_t bilinearSample(const uint8_t* __restrict__ src,
-                                         int32_t x_fp, int32_t y_fp) noexcept;
+    static uint8_t bilinearSample(const uint8_t* __restrict__ src,
+                                  int32_t x_fp, int32_t y_fp) noexcept;
 };
